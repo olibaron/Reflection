@@ -4,14 +4,11 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 contract ReflectionToken is ERC20, Ownable, ReentrancyGuard {
-    using EnumerableSet for EnumerableSet.AddressSet;
-
-    uint256 public taxRate = 5; // Example 5% tax
-    uint256 public liquidityRate = 2; // 2% liquidity
-    uint256 public minimumTaxThreshold = 1 ether; // Example threshold for triggering tax wallet
+    uint256 public constant taxRate = 5; // Example 5% tax
+    uint256 public constant liquidityRate = 2; // 2% liquidity
+    uint256 public constant minimumTaxThreshold = 1 ether; // Example threshold for triggering tax wallet
     uint256 public lastDistributionTime;
     uint256 public distributionInterval = 888 * 15; // Example time for distribution (3 hours with block time ~15s)
 
@@ -19,14 +16,12 @@ contract ReflectionToken is ERC20, Ownable, ReentrancyGuard {
     address public liquidityWallet;
     address public taxWallet;
 
-    mapping(address => bool) private excludedFromRewards;
-    EnumerableSet.AddressSet private holders;
+    address[] private holders;
+    mapping(address => bool) public holderExists;
+    mapping(address => bool) public excludedFromRewards;
+    mapping(address => bool) private includedInRewards;
 
     event RewardsDistributed(uint256 amount, uint256 time);
-    event TaxRateUpdated(uint256 newTaxRate);
-    event LiquidityRateUpdated(uint256 newLiquidityRate);
-    event MinimumTaxThresholdUpdated(uint256 newThreshold);
-    event DistributionIntervalUpdated(uint256 newInterval);
 
     constructor(
         string memory name,
@@ -39,6 +34,14 @@ contract ReflectionToken is ERC20, Ownable, ReentrancyGuard {
         liquidityWallet = _liquidityWallet;
         taxWallet = _taxWallet;
         lastDistributionTime = block.timestamp;
+    }
+
+    // Allow the contract to receive ETH
+    receive() external payable {}
+
+    // Mint function to create new tokens
+    function mint(address to, uint256 amount) external onlyOwner {
+        _mint(to, amount);
     }
 
     // Override the transfer function to include tax and liquidity handling
@@ -55,7 +58,10 @@ contract ReflectionToken is ERC20, Ownable, ReentrancyGuard {
         super._transfer(sender, liquidityWallet, liquidityAmount); // Add liquidity
         super._transfer(sender, recipient, transferAmount); // Transfer remaining amount
 
-        _updateHolders(sender, recipient);
+        if (!holderExists[recipient]) {
+            holders.push(recipient);
+            holderExists[recipient] = true;
+        }
 
         if (balanceOf(address(this)) >= minimumTaxThreshold) {
             _sendToTaxWallet();
@@ -74,52 +80,53 @@ contract ReflectionToken is ERC20, Ownable, ReentrancyGuard {
 
         uint256 amountToDistribute = (rewardsBalance * 70) / 100; // 70% to holders
 
-        _distributeToHolders(amountToDistribute);
+        // State updates before external interactions
         lastDistributionTime = block.timestamp;
+
+        _distributeToHolders(amountToDistribute);
 
         emit RewardsDistributed(amountToDistribute, block.timestamp);
     }
 
     // Internal function to handle tax wallet transfer to rewards wallet
-    function _sendToTaxWallet() internal {
+    function _sendToTaxWallet() internal nonReentrant {
         uint256 taxBalance = balanceOf(address(this));
         super._transfer(address(this), taxWallet, taxBalance);
-        payable(rewardsWallet).transfer(address(this).balance); // Send ETH to rewards wallet
+
+        (bool success, ) = payable(rewardsWallet).call{
+            value: address(this).balance
+        }("");
+        require(success, "Transfer to rewards wallet failed.");
     }
 
     // Internal function to distribute ETH to holders
     function _distributeToHolders(uint256 amount) internal {
         uint256 totalSupply_ = totalSupply();
-        uint256 numHolders = holders.length();
-
-        for (uint256 i = 0; i < numHolders; i++) {
-            address holder = holders.at(i);
-            if (!excludedFromRewards[holder] && balanceOf(holder) > 0) {
+        for (uint256 i = 0; i < holders.length; i++) {
+            address holder = holders[i];
+            if (!excludedFromRewards[holder]) {
                 uint256 holderBalance = balanceOf(holder);
                 uint256 holderShare = (amount * holderBalance) / totalSupply_;
-                payable(holder).transfer(holderShare);
+                (bool success, ) = payable(holder).call{value: holderShare}("");
+                require(success, "Transfer to holder failed.");
             }
         }
     }
 
-    // Function to set tax rate
-    function setTaxRate(uint256 newTaxRate) external onlyOwner {
-        require(newTaxRate <= 10, "Tax rate too high"); // Example upper limit
-        taxRate = newTaxRate;
-        emit TaxRateUpdated(newTaxRate);
+    // Add or remove addresses from exclusion
+    function setExcludedFromRewards(
+        address account,
+        bool excluded
+    ) external onlyOwner {
+        excludedFromRewards[account] = excluded;
     }
 
-    // Function to set liquidity rate
-    function setLiquidityRate(uint256 newLiquidityRate) external onlyOwner {
-        require(newLiquidityRate <= 5, "Liquidity rate too high"); // Example upper limit
-        liquidityRate = newLiquidityRate;
-        emit LiquidityRateUpdated(newLiquidityRate);
-    }
-
-    // Function to set minimum tax threshold
-    function setMinimumTaxThreshold(uint256 newThreshold) external onlyOwner {
-        minimumTaxThreshold = newThreshold;
-        emit MinimumTaxThresholdUpdated(newThreshold);
+    // Add addresses to include in rewards
+    function setIncludedInRewards(
+        address account,
+        bool included
+    ) external onlyOwner {
+        includedInRewards[account] = included;
     }
 
     // Function to set distribution interval (4-12 hours)
@@ -131,24 +138,5 @@ contract ReflectionToken is ERC20, Ownable, ReentrancyGuard {
             "Interval must be between 4 and 12 hours"
         );
         distributionInterval = intervalInSeconds;
-        emit DistributionIntervalUpdated(intervalInSeconds);
-    }
-
-    // Add or remove addresses from exclusion
-    function setExcludedFromRewards(
-        address account,
-        bool excluded
-    ) external onlyOwner {
-        excludedFromRewards[account] = excluded;
-    }
-
-    // Update the holders set on transfer
-    function _updateHolders(address sender, address recipient) internal {
-        if (balanceOf(sender) == 0) {
-            holders.remove(sender);
-        }
-        if (balanceOf(recipient) > 0 && !holders.contains(recipient)) {
-            holders.add(recipient);
-        }
     }
 }
